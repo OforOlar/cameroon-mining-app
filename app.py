@@ -32,7 +32,7 @@ def load_and_train():
     # --- Load Data ---
     df = pd.read_csv('Cameroon_Informal_Survey_2006_REAL.csv', encoding='latin1')
 
-    # --- Fill Missing Values ---
+    # --- Fill Missing Values for Numeric Columns ---
     numeric_cols = ['monthly_sales_fcfa', 'annual_sales_fcfa', 'annual_costs_fcfa',
                     'repeat_customer_pct', 'avg_obstacle_severity',
                     'finance_obstacle_rating', 'local_sales_pct']
@@ -40,11 +40,20 @@ def load_and_train():
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
+    # --- Fill Missing Values for Categorical Columns ---
     cat_cols = ['owner_gender', 'edu_level', 'finance_access',
                 'electricity_problems', 'supplier_issues']
     for col in cat_cols:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].mode()[0])
+
+    # --- Drop any remaining rows with missing values in feature columns ---
+    # This prevents errors on Streamlit Cloud which is stricter than local
+    feature_cols_check = ['location', 'business_type', 'owner_gender', 'edu_level',
+                          'finance_access', 'electricity_problems', 'supplier_issues',
+                          'avg_obstacle_severity', 'local_sales_pct', 'repeat_customer_pct']
+    feature_cols_check = [c for c in feature_cols_check if c in df.columns]
+    df = df.dropna(subset=feature_cols_check).reset_index(drop=True)
 
     # --- Performance Label ---
     sales_median = df['monthly_sales_fcfa'].median()
@@ -77,10 +86,11 @@ def load_and_train():
         X, y, test_size=0.20, random_state=42, stratify=y
     )
 
+    # --- Convert to numpy arrays to avoid pandas NaN issues on cloud ---
+    X_train_arr = X_train.values.astype(float)
+    X_test_arr = X_test.values.astype(float)
+
     # --- Random Forest with Calibration ---
-    # Random Forest builds 100 trees and averages their results.
-    # CalibratedClassifierCV ensures probabilities are realistic
-    # and not always 0% or 100%.
     base_model = RandomForestClassifier(
         n_estimators=100,
         max_depth=4,
@@ -90,10 +100,10 @@ def load_and_train():
         class_weight='balanced'
     )
     model = CalibratedClassifierCV(base_model, cv=3)
-    model.fit(X_train, y_train)
+    model.fit(X_train_arr, y_train)
 
     # --- Evaluate ---
-    y_pred = model.predict(X_test)
+    y_pred = model.predict(X_test_arr)
     acc = accuracy_score(y_test, y_pred)
     report = classification_report(
         y_test, y_pred,
@@ -126,12 +136,12 @@ def load_and_train():
 
     return (df, model, label_encoders, le_target, feature_cols,
             scaler, kmeans, clustering_features, cluster_names,
-            acc, report, cm, X_scaled)
+            acc, report, cm, X_scaled, X_test_arr)
 
 
 (df, model, label_encoders, le_target, feature_cols,
  scaler, kmeans, clustering_features, cluster_names,
- acc, report, cm, X_scaled) = load_and_train()
+ acc, report, cm, X_scaled, X_test_arr) = load_and_train()
 
 # ============================================================
 # SIDEBAR NAVIGATION
@@ -314,7 +324,7 @@ elif page == "🔵 Clustering Results":
         count1 = len(df[df['cluster_name'] == 'Struggling Survivalists'])
         avg1 = df[df['cluster_name'] == 'Struggling Survivalists']['monthly_sales_fcfa'].mean()
         st.error(f"""
-        ### 🔴 Struggling Survivalists
+        ### Struggling Survivalists
         **{count1} businesses**
 
         Avg Monthly Sales: **{avg1:,.0f} FCFA**
@@ -328,7 +338,7 @@ elif page == "🔵 Clustering Results":
         count2 = len(df[df['cluster_name'] == 'Urban Grinders'])
         avg2 = df[df['cluster_name'] == 'Urban Grinders']['monthly_sales_fcfa'].mean()
         st.warning(f"""
-        ### 🟡 Urban Grinders
+        ### Urban Grinders
         **{count2} businesses**
 
         Avg Monthly Sales: **{avg2:,.0f} FCFA**
@@ -342,7 +352,7 @@ elif page == "🔵 Clustering Results":
         count3 = len(df[df['cluster_name'] == 'Hidden Performers'])
         avg3 = df[df['cluster_name'] == 'Hidden Performers']['monthly_sales_fcfa'].mean()
         st.success(f"""
-        ### 🟢 Hidden Performers
+        ### Hidden Performers
         **{count3} business**
 
         Avg Monthly Sales: **{avg3:,.0f} FCFA**
@@ -440,12 +450,12 @@ elif page == "🔗 Association Rules":
 
     Support: **18%** (18 out of 99 businesses)
     Confidence: **62%** (when these conditions exist, 62% chance of High Sales)
-    Lift: **1.31** (31% more likely than random chance — a genuine pattern, not coincidence)
+    Lift: **1.31** (31% more likely than random chance)
 
     **What this means:**
     Female business owners in Cameroon overcome supplier challenges
-    and still achieve above-average sales.
-    This shows strong resilience and effective use of informal networks.
+    and still achieve above-average sales, showing strong resilience
+    and effective use of informal networks.
     """)
 
     st.markdown("---")
@@ -485,14 +495,17 @@ elif page == "🤖 Model Evaluation":
 
     hp = report.get('High_Performer', {})
     st_r = report.get('Struggling', {})
-    col3.metric("Macro F1 Score", f"{report.get('macro avg', {}).get('f1-score', 0):.2f}")
-    col4.metric("Weighted F1 Score", f"{report.get('weighted avg', {}).get('f1-score', 0):.2f}")
+    col3.metric("Macro F1 Score",
+                f"{report.get('macro avg', {}).get('f1-score', 0):.2f}")
+    col4.metric("Weighted F1 Score",
+                f"{report.get('weighted avg', {}).get('f1-score', 0):.2f}")
 
     st.markdown("---")
     st.subheader("Detailed Metrics by Class")
 
     metrics_df = pd.DataFrame({
-        'Class': ['High_Performer', 'Struggling', 'Macro Average', 'Weighted Average'],
+        'Class': ['High_Performer', 'Struggling',
+                  'Macro Average', 'Weighted Average'],
         'Precision': [
             f"{hp.get('precision', 0):.2f}",
             f"{st_r.get('precision', 0):.2f}",
@@ -582,8 +595,8 @@ elif page == "🤖 Model Evaluation":
                  fontweight='bold')
     plt.tight_layout()
     st.pyplot(fig)
-    st.caption("Average obstacle severity is by far the strongest predictor "
-               "with a score of 0.42, more than twice the next variable.")
+    st.caption("Average obstacle severity is the strongest predictor "
+               "with a score of 0.42.")
 
 # ============================================================
 # PAGE 6: PREDICT A BUSINESS
@@ -607,7 +620,8 @@ elif page == "🔮 Predict a Business":
         edu_level = st.selectbox("Education Level of Owner", [
             "Primary", "None", "Secondary",
             "Technical", "University", "Other"])
-        finance_access = st.selectbox("Has Access to Formal Finance?", ["No", "Yes"])
+        finance_access = st.selectbox(
+            "Has Access to Formal Finance?", ["No", "Yes"])
 
     with col2:
         st.subheader("Business Environment")
@@ -645,19 +659,23 @@ elif page == "🔮 Predict a Business":
 
         new_df = pd.DataFrame([new_business])
 
+        # Encode categorical columns
         for col in feature_cols:
             if col in label_encoders:
                 le = label_encoders[col]
-                val = new_df[col].astype(str)
                 known = list(le.classes_)
-                new_df[col] = val.apply(
+                new_df[col] = new_df[col].astype(str).apply(
                     lambda x: le.transform([x])[0] if x in known
                     else le.transform([known[0]])[0]
                 )
 
-        prediction_encoded = model.predict(new_df[feature_cols])
+        # Convert to numpy array to match training format
+        input_array = new_df[feature_cols].values.astype(float)
+
+        prediction_encoded = model.predict(input_array)
         prediction_label = le_target.inverse_transform(prediction_encoded)[0]
-        prediction_proba = model.predict_proba(new_df[feature_cols])[0]
+        prediction_proba = model.predict_proba(input_array)[0]
+
         classes = le_target.classes_
         proba_dict = dict(zip(classes, prediction_proba))
 
@@ -668,9 +686,9 @@ elif page == "🔮 Predict a Business":
         st.subheader("Prediction Result")
 
         if prediction_label == "High_Performer":
-            st.success(f"### This business is predicted to be a HIGH PERFORMER")
+            st.success("### This business is predicted to be a HIGH PERFORMER")
         else:
-            st.error(f"### This business is predicted to be STRUGGLING")
+            st.error("### This business is predicted to be STRUGGLING")
 
         col3, col4, col5 = st.columns(3)
         col3.metric("High Performer Probability", f"{hp_prob*100:.1f}%")
