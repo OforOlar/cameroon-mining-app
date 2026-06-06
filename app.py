@@ -13,6 +13,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.impute import SimpleImputer
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -24,36 +25,39 @@ st.set_page_config(
 )
 
 # ============================================================
-# LOAD AND TRAIN (runs once, cached for speed)
+# LOAD AND TRAIN
 # ============================================================
 @st.cache_data
 def load_and_train():
 
     # --- Load Data ---
-    df = pd.read_csv('Cameroon_Informal_Survey_2006_REAL.csv', encoding='latin1')
+    df = pd.read_csv(
+        'Cameroon_Informal_Survey_2006_REAL.csv',
+        encoding='latin1'
+    )
 
     # --- Fill Missing Values for Numeric Columns ---
-    numeric_cols = ['monthly_sales_fcfa', 'annual_sales_fcfa', 'annual_costs_fcfa',
-                    'repeat_customer_pct', 'avg_obstacle_severity',
-                    'finance_obstacle_rating', 'local_sales_pct']
+    numeric_cols = [
+        'monthly_sales_fcfa', 'annual_sales_fcfa', 'annual_costs_fcfa',
+        'repeat_customer_pct', 'avg_obstacle_severity',
+        'finance_obstacle_rating', 'local_sales_pct'
+    ]
     for col in numeric_cols:
         if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
             df[col] = df[col].fillna(df[col].median())
 
     # --- Fill Missing Values for Categorical Columns ---
-    cat_cols = ['owner_gender', 'edu_level', 'finance_access',
-                'electricity_problems', 'supplier_issues']
+    cat_cols = [
+        'location', 'business_type', 'owner_gender', 'edu_level',
+        'finance_access', 'electricity_problems', 'supplier_issues'
+    ]
     for col in cat_cols:
         if col in df.columns:
-            df[col] = df[col].fillna(df[col].mode()[0])
-
-    # --- Drop any remaining rows with missing values in feature columns ---
-    # This prevents errors on Streamlit Cloud which is stricter than local
-    feature_cols_check = ['location', 'business_type', 'owner_gender', 'edu_level',
-                          'finance_access', 'electricity_problems', 'supplier_issues',
-                          'avg_obstacle_severity', 'local_sales_pct', 'repeat_customer_pct']
-    feature_cols_check = [c for c in feature_cols_check if c in df.columns]
-    df = df.dropna(subset=feature_cols_check).reset_index(drop=True)
+            df[col] = df[col].astype(str).replace('nan', 'Unknown')
+            mode_val = df[col].mode()
+            if len(mode_val) > 0:
+                df[col] = df[col].replace('Unknown', mode_val[0])
 
     # --- Performance Label ---
     sales_median = df['monthly_sales_fcfa'].median()
@@ -62,9 +66,11 @@ def load_and_train():
     )
 
     # --- Features for Classification ---
-    feature_cols = ['location', 'business_type', 'owner_gender', 'edu_level',
-                    'finance_access', 'electricity_problems', 'supplier_issues',
-                    'avg_obstacle_severity', 'local_sales_pct', 'repeat_customer_pct']
+    feature_cols = [
+        'location', 'business_type', 'owner_gender', 'edu_level',
+        'finance_access', 'electricity_problems', 'supplier_issues',
+        'avg_obstacle_severity', 'local_sales_pct', 'repeat_customer_pct'
+    ]
     feature_cols = [c for c in feature_cols if c in df.columns]
 
     df_class = df[feature_cols + ['performance']].copy()
@@ -72,23 +78,25 @@ def load_and_train():
     # --- Encode Categorical Columns ---
     label_encoders = {}
     for col in feature_cols:
-        if df_class[col].dtype == 'object':
-            le = LabelEncoder()
-            df_class[col] = le.fit_transform(df_class[col].astype(str))
-            label_encoders[col] = le
+        df_class[col] = df_class[col].astype(str)
+        le = LabelEncoder()
+        df_class[col] = le.fit_transform(df_class[col])
+        label_encoders[col] = le
 
+    # --- Encode Target ---
     le_target = LabelEncoder()
+    df_class['performance'] = df_class['performance'].astype(str)
     y = le_target.fit_transform(df_class['performance'])
     X = df_class[feature_cols]
 
-    # --- Train / Test Split ---
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
+    # --- Use SimpleImputer to guarantee no NaN remains ---
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = imputer.fit_transform(X)
 
-    # --- Convert to numpy arrays to avoid pandas NaN issues on cloud ---
-    X_train_arr = X_train.values.astype(float)
-    X_test_arr = X_test.values.astype(float)
+    # --- Train / Test Split ---
+    X_train_arr, X_test_arr, y_train, y_test = train_test_split(
+        X_imputed, y, test_size=0.20, random_state=42, stratify=y
+    )
 
     # --- Random Forest with Calibration ---
     base_model = RandomForestClassifier(
@@ -113,12 +121,18 @@ def load_and_train():
     cm = confusion_matrix(y_test, y_pred)
 
     # --- K-Means Clustering ---
-    clustering_features = ['monthly_sales_fcfa', 'annual_sales_fcfa',
-                            'avg_obstacle_severity', 'finance_obstacle_rating',
-                            'local_sales_pct', 'repeat_customer_pct']
+    clustering_features = [
+        'monthly_sales_fcfa', 'annual_sales_fcfa',
+        'avg_obstacle_severity', 'finance_obstacle_rating',
+        'local_sales_pct', 'repeat_customer_pct'
+    ]
     clustering_features = [c for c in clustering_features if c in df.columns]
 
     X_cluster = df[clustering_features].copy()
+    for col in clustering_features:
+        X_cluster[col] = pd.to_numeric(X_cluster[col], errors='coerce')
+        X_cluster[col] = X_cluster[col].fillna(X_cluster[col].median())
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_cluster)
 
@@ -134,14 +148,16 @@ def load_and_train():
     }
     df['cluster_name'] = df['cluster'].map(cluster_names)
 
-    return (df, model, label_encoders, le_target, feature_cols,
-            scaler, kmeans, clustering_features, cluster_names,
-            acc, report, cm, X_scaled, X_test_arr)
+    return (
+        df, model, label_encoders, le_target, feature_cols,
+        scaler, kmeans, clustering_features, cluster_names,
+        acc, report, cm, X_scaled, imputer
+    )
 
 
 (df, model, label_encoders, le_target, feature_cols,
  scaler, kmeans, clustering_features, cluster_names,
- acc, report, cm, X_scaled, X_test_arr) = load_and_train()
+ acc, report, cm, X_scaled, imputer) = load_and_train()
 
 # ============================================================
 # SIDEBAR NAVIGATION
@@ -162,8 +178,10 @@ page = st.sidebar.radio("Go to", [
 # ============================================================
 if page == "🏠 Home":
     st.title("Cameroon Informal Business Data Mining")
-    st.subheader("Mining Patterns in the Characteristics and Performance"
-                 " of Informal Businesses in Cameroon")
+    st.subheader(
+        "Mining Patterns in the Characteristics and Performance"
+        " of Informal Businesses in Cameroon"
+    )
     st.markdown("**Dataset:** World Bank Informal Sector Survey, Cameroon 2006")
     st.markdown("**Course:** CEC420 Data Mining | University of Buea")
     st.markdown("---")
@@ -186,7 +204,6 @@ if page == "🏠 Home":
     - **Random Forest Classification** — predicts business performance
 
     ### How to Use This App
-    Use the navigation panel on the left to explore each section:
 
     | Page | What You Will Find |
     |---|---|
@@ -205,16 +222,20 @@ elif page == "📋 Dataset Overview":
     st.markdown("---")
 
     st.subheader("Sample Data (First 10 Businesses)")
-    display_cols = ['location', 'business_type', 'owner_gender', 'edu_level',
-                    'monthly_sales_fcfa', 'finance_access', 'electricity_problems',
-                    'avg_obstacle_severity', 'performance']
+    display_cols = [
+        'location', 'business_type', 'owner_gender', 'edu_level',
+        'monthly_sales_fcfa', 'finance_access', 'electricity_problems',
+        'avg_obstacle_severity', 'performance'
+    ]
     display_cols = [c for c in display_cols if c in df.columns]
     st.dataframe(df[display_cols].head(10))
 
     st.markdown("---")
     st.subheader("Key Statistics")
-    stats_cols = ['monthly_sales_fcfa', 'avg_obstacle_severity',
-                  'local_sales_pct', 'repeat_customer_pct']
+    stats_cols = [
+        'monthly_sales_fcfa', 'avg_obstacle_severity',
+        'local_sales_pct', 'repeat_customer_pct'
+    ]
     stats_cols = [c for c in stats_cols if c in df.columns]
     st.dataframe(df[stats_cols].describe().round(2))
 
@@ -222,7 +243,6 @@ elif page == "📋 Dataset Overview":
     st.subheader("Visual Exploration")
 
     col1, col2 = st.columns(2)
-
     with col1:
         fig, ax = plt.subplots(figsize=(5, 4))
         df['location'].value_counts().plot(
@@ -233,7 +253,7 @@ elif page == "📋 Dataset Overview":
         plt.xticks(rotation=0)
         plt.tight_layout()
         st.pyplot(fig)
-        st.caption("Almost all businesses are in urban areas (Douala and Yaounde).")
+        st.caption("Almost all businesses are in urban areas.")
 
     with col2:
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -244,10 +264,9 @@ elif page == "📋 Dataset Overview":
         ax.set_ylabel('')
         plt.tight_layout()
         st.pyplot(fig)
-        st.caption("Gender is nearly equal: 52.5% male and 47.5% female.")
+        st.caption("52.5% male and 47.5% female.")
 
     col3, col4 = st.columns(2)
-
     with col3:
         fig, ax = plt.subplots(figsize=(5, 4))
         ax.hist(df['monthly_sales_fcfa'], bins=20,
@@ -262,13 +281,15 @@ elif page == "📋 Dataset Overview":
         ax.legend()
         plt.tight_layout()
         st.pyplot(fig)
-        st.caption("Most businesses earn very little. A few outliers earn significantly more.")
+        st.caption("Most businesses earn very little. A few outliers earn much more.")
 
     with col4:
         fig, ax = plt.subplots(figsize=(5, 4))
         edu_order = ['None', 'Primary', 'Secondary', 'Technical', 'University', 'Other']
         edu_counts = df['edu_level'].value_counts().reindex(
-            [e for e in edu_order if e in df['edu_level'].unique()], fill_value=0)
+            [e for e in edu_order if e in df['edu_level'].unique()],
+            fill_value=0
+        )
         edu_counts.plot(kind='bar', color='#2196F3', ax=ax)
         ax.set_title('Education Level of Owners', fontweight='bold')
         ax.set_xlabel('Education Level')
@@ -276,10 +297,9 @@ elif page == "📋 Dataset Overview":
         plt.xticks(rotation=15)
         plt.tight_layout()
         st.pyplot(fig)
-        st.caption("Primary education dominates. Very few owners have university qualifications.")
+        st.caption("Primary education dominates across all businesses.")
 
     col5, col6 = st.columns(2)
-
     with col5:
         fig, ax = plt.subplots(figsize=(5, 4))
         df['performance'].value_counts().plot(
@@ -290,75 +310,72 @@ elif page == "📋 Dataset Overview":
         plt.xticks(rotation=0)
         plt.tight_layout()
         st.pyplot(fig)
-        st.caption("Near-equal split: 49 High Performers and 50 Struggling businesses.")
+        st.caption("49 High Performers and 50 Struggling businesses.")
 
     with col6:
         fig, ax = plt.subplots(figsize=(5, 4))
-        if 'finance_access' in df.columns and 'performance' in df.columns:
-            ct = pd.crosstab(df['finance_access'], df['performance'])
-            ct.plot(kind='bar', stacked=True,
-                    color=['#E74C3C', '#2ECC71'], ax=ax)
-            ax.set_title('Finance Access vs Performance', fontweight='bold')
-            ax.set_xlabel('Has Finance Access?')
-            ax.set_ylabel('Number of Businesses')
-            plt.xticks(rotation=0)
-            ax.legend(title='Performance')
-            plt.tight_layout()
-            st.pyplot(fig)
-            st.caption("Most businesses lack finance access yet some still perform well.")
+        ct = pd.crosstab(df['finance_access'], df['performance'])
+        ct.plot(kind='bar', stacked=True,
+                color=['#E74C3C', '#2ECC71'], ax=ax)
+        ax.set_title('Finance Access vs Performance', fontweight='bold')
+        ax.set_xlabel('Has Finance Access?')
+        ax.set_ylabel('Number of Businesses')
+        plt.xticks(rotation=0)
+        ax.legend(title='Performance')
+        plt.tight_layout()
+        st.pyplot(fig)
+        st.caption("Most lack finance access yet some still perform well.")
 
 # ============================================================
 # PAGE 3: CLUSTERING RESULTS
 # ============================================================
 elif page == "🔵 Clustering Results":
     st.title("K-Means Clustering Results")
-    st.markdown("K-Means grouped the 99 businesses into 3 natural clusters "
-                "based on their numeric characteristics. "
-                "The Elbow Method confirmed K=3 as optimal.")
+    st.markdown(
+        "K-Means grouped the 99 businesses into 3 natural clusters. "
+        "The Elbow Method confirmed K=3 as optimal."
+    )
     st.markdown("---")
 
     st.subheader("The Three Business Groups")
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        count1 = len(df[df['cluster_name'] == 'Struggling Survivalists'])
-        avg1 = df[df['cluster_name'] == 'Struggling Survivalists']['monthly_sales_fcfa'].mean()
+        n = len(df[df['cluster_name'] == 'Struggling Survivalists'])
+        avg = df[df['cluster_name'] == 'Struggling Survivalists']['monthly_sales_fcfa'].mean()
         st.error(f"""
         ### Struggling Survivalists
-        **{count1} businesses**
+        **{n} businesses**
 
-        Avg Monthly Sales: **{avg1:,.0f} FCFA**
+        Avg Monthly Sales: **{avg:,.0f} FCFA**
 
         Sell 88% to local customers only.
-        Low obstacle severity but very low earnings.
-        Exist purely to survive day to day.
+        Very low earnings. Exist to survive.
         """)
 
     with col2:
-        count2 = len(df[df['cluster_name'] == 'Urban Grinders'])
-        avg2 = df[df['cluster_name'] == 'Urban Grinders']['monthly_sales_fcfa'].mean()
+        n = len(df[df['cluster_name'] == 'Urban Grinders'])
+        avg = df[df['cluster_name'] == 'Urban Grinders']['monthly_sales_fcfa'].mean()
         st.warning(f"""
         ### Urban Grinders
-        **{count2} businesses**
+        **{n} businesses**
 
-        Avg Monthly Sales: **{avg2:,.0f} FCFA**
+        Avg Monthly Sales: **{avg:,.0f} FCFA**
 
         Highest obstacle severity (4/5).
-        60% repeat customers (most loyal).
-        Trying to grow but being held back.
+        60% repeat customers. Trying to grow.
         """)
 
     with col3:
-        count3 = len(df[df['cluster_name'] == 'Hidden Performers'])
-        avg3 = df[df['cluster_name'] == 'Hidden Performers']['monthly_sales_fcfa'].mean()
+        n = len(df[df['cluster_name'] == 'Hidden Performers'])
+        avg = df[df['cluster_name'] == 'Hidden Performers']['monthly_sales_fcfa'].mean()
         st.success(f"""
         ### Hidden Performers
-        **{count3} business**
+        **{n} business**
 
-        Avg Monthly Sales: **{avg3:,.0f} FCFA**
+        Avg Monthly Sales: **{avg:,.0f} FCFA**
 
         Sells beyond local area.
-        Lowest obstacle severity.
         25x more productive than Urban Grinders.
         """)
 
@@ -377,23 +394,24 @@ elif page == "🔵 Clustering Results":
     for name, color in colors_map.items():
         mask = df['cluster_name'] == name
         ax.scatter(X_pca[mask, 0], X_pca[mask, 1],
-                   label=name, color=color,
-                   alpha=0.7, s=80, edgecolor='white')
+                   label=name, color=color, alpha=0.7, s=80, edgecolor='white')
 
     centers_pca = pca.transform(kmeans.cluster_centers_)
     ax.scatter(centers_pca[:, 0], centers_pca[:, 1],
                marker='X', s=300, c='black', zorder=5, label='Cluster Centers')
     ax.set_title('K-Means Clustering of Cameroon Informal Businesses',
                  fontsize=13, fontweight='bold')
-    ax.set_xlabel(f'Principal Component 1 '
-                  f'({pca.explained_variance_ratio_[0]*100:.1f}% variance)')
-    ax.set_ylabel(f'Principal Component 2 '
-                  f'({pca.explained_variance_ratio_[1]*100:.1f}% variance)')
+    ax.set_xlabel(
+        f'Principal Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}% variance)')
+    ax.set_ylabel(
+        f'Principal Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}% variance)')
     ax.legend()
     plt.tight_layout()
     st.pyplot(fig)
-    st.caption("Each dot is one business. The black X marks are cluster centres. "
-               "The single green dot far to the right is the Hidden Performers cluster.")
+    st.caption(
+        "Each dot is one business. Black X marks are cluster centres. "
+        "The single green dot far right is the Hidden Performers cluster."
+    )
 
     st.markdown("---")
     st.subheader("Cluster Average Profiles")
@@ -405,8 +423,10 @@ elif page == "🔵 Clustering Results":
 # ============================================================
 elif page == "🔗 Association Rules":
     st.title("Apriori Association Rule Mining")
-    st.markdown("The Apriori algorithm found combinations of business attributes "
-                "that appear together frequently across the 99 businesses.")
+    st.markdown(
+        "The Apriori algorithm found combinations of business attributes "
+        "that appear together frequently across the 99 businesses."
+    )
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
@@ -416,31 +436,31 @@ elif page == "🔗 Association Rules":
 
     st.markdown("---")
     st.subheader("Understanding the Metrics")
-
     col4, col5, col6 = st.columns(3)
     with col4:
-        st.info("**Support**\n\nHow common a combination is across all 99 businesses. "
-                "Support of 18% means 18 out of 99 businesses share that combination.")
+        st.info(
+            "**Support**\n\nHow common a combination is. "
+            "18% means 18 out of 99 businesses share it."
+        )
     with col5:
-        st.info("**Confidence**\n\nHow reliable the rule is. "
-                "Confidence of 62% means when the IF conditions are true, "
-                "there is a 62% chance the THEN result also applies.")
+        st.info(
+            "**Confidence**\n\nHow reliable the rule is. "
+            "62% means a 62% chance the THEN result applies."
+        )
     with col6:
-        st.info("**Lift**\n\nWhether the pattern is stronger than random chance. "
-                "Lift above 1.0 means the rule is genuine. "
-                "Lift of 1.31 means 31% more likely than chance.")
+        st.info(
+            "**Lift**\n\nWhether the pattern beats random chance. "
+            "1.31 means 31% more likely than chance."
+        )
 
     st.markdown("---")
     st.subheader("Universal Finding (Support = 100%)")
     st.warning("""
     All 99 businesses share these three characteristics:
 
-    Every business is located in an **Urban area**.
-    Every business owner has **Primary level education**.
+    Every business is in an **Urban area**.
+    Every owner has **Primary level education**.
     Every business has **NO access to formal finance**.
-
-    This means all businesses face the same structural disadvantages
-    regardless of how well they perform.
     """)
 
     st.markdown("---")
@@ -448,14 +468,10 @@ elif page == "🔗 Association Rules":
     st.success("""
     **IF** Female Owner **AND** Supplier Issues **THEN** High Sales
 
-    Support: **18%** (18 out of 99 businesses)
-    Confidence: **62%** (when these conditions exist, 62% chance of High Sales)
-    Lift: **1.31** (31% more likely than random chance)
+    Support: **18%** | Confidence: **62%** | Lift: **1.31**
 
-    **What this means:**
     Female business owners in Cameroon overcome supplier challenges
-    and still achieve above-average sales, showing strong resilience
-    and effective use of informal networks.
+    and still achieve above-average sales, showing strong resilience.
     """)
 
     st.markdown("---")
@@ -465,16 +481,13 @@ elif page == "🔗 Association Rules":
             'Female owner AND Supplier issues',
             'Female + No finance + Supplier issues',
             'Urban + Female + Supplier issues',
-            'Primary education + Female + Supplier issues',
+            'Primary edu + Female + Supplier issues',
             'Female + No finance + Urban + Supplier issues'
         ],
-        'THEN (Consequent)': [
-            'High Sales', 'High Sales', 'High Sales',
-            'High Sales', 'High Sales'
-        ],
-        'Support': ['18%', '18%', '18%', '18%', '18%'],
-        'Confidence': ['62%', '62%', '62%', '62%', '62%'],
-        'Lift': ['1.31', '1.31', '1.31', '1.31', '1.31']
+        'THEN': ['High Sales'] * 5,
+        'Support': ['18%'] * 5,
+        'Confidence': ['62%'] * 5,
+        'Lift': ['1.31'] * 5
     })
     st.dataframe(rules_data, use_container_width=True)
 
@@ -483,18 +496,16 @@ elif page == "🔗 Association Rules":
 # ============================================================
 elif page == "🤖 Model Evaluation":
     st.title("Classification Model Evaluation")
-    st.markdown("A **Random Forest Classifier** was used to predict whether "
-                "a business is a High Performer or Struggling. "
-                "The model was trained on 79 businesses and tested on 20.")
+    st.markdown(
+        "A **Random Forest Classifier** predicts whether a business is "
+        "a High Performer or Struggling. "
+        "Trained on 79 businesses, tested on 20."
+    )
     st.markdown("---")
 
-    st.subheader("Overall Performance")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Accuracy", f"{acc:.1%}")
     col2.metric("Baseline (Random Guess)", "50.0%")
-
-    hp = report.get('High_Performer', {})
-    st_r = report.get('Struggling', {})
     col3.metric("Macro F1 Score",
                 f"{report.get('macro avg', {}).get('f1-score', 0):.2f}")
     col4.metric("Weighted F1 Score",
@@ -502,6 +513,9 @@ elif page == "🤖 Model Evaluation":
 
     st.markdown("---")
     st.subheader("Detailed Metrics by Class")
+
+    hp  = report.get('High_Performer', {})
+    st_r = report.get('Struggling', {})
 
     metrics_df = pd.DataFrame({
         'Class': ['High_Performer', 'Struggling',
@@ -534,23 +548,21 @@ elif page == "🤖 Model Evaluation":
     st.dataframe(metrics_df, use_container_width=True)
 
     st.markdown("""
-    **What each metric means:**
-    - **Precision:** Of all businesses predicted as High Performer, how many actually were?
-    - **Recall:** Of all actual High Performers, how many did the model correctly find?
-    - **F1 Score:** The balance between precision and recall in one number.
-    - **Support:** How many test businesses belong to each class.
+    - **Precision:** Of businesses predicted High Performer, how many actually were?
+    - **Recall:** Of all actual High Performers, how many did the model find?
+    - **F1 Score:** Balance between precision and recall in one number.
+    - **Support:** Number of test businesses in each class.
     """)
 
     st.markdown("---")
-    st.subheader("Confusion Matrix")
     col5, col6 = st.columns(2)
 
     with col5:
+        st.subheader("Confusion Matrix")
         fig, ax = plt.subplots(figsize=(5, 4))
-        classes = le_target.classes_
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=classes,
-                    yticklabels=classes,
+                    xticklabels=le_target.classes_,
+                    yticklabels=le_target.classes_,
                     linewidths=2, ax=ax)
         ax.set_title('Confusion Matrix', fontweight='bold')
         ax.set_ylabel('Actual Label')
@@ -559,86 +571,82 @@ elif page == "🤖 Model Evaluation":
         st.pyplot(fig)
 
     with col6:
-        st.markdown("### Reading the Confusion Matrix")
+        st.subheader("Reading the Matrix")
         st.markdown("""
-        The matrix compares what the model predicted
-        against what was actually true for the 20 test businesses.
-
-        - **Top-left:** Actual High Performers correctly predicted
-        - **Bottom-right:** Actual Struggling correctly predicted
+        - **Top-left:** High Performers correctly predicted
+        - **Bottom-right:** Struggling correctly predicted
         - **Top-right:** High Performers wrongly called Struggling
         - **Bottom-left:** Struggling wrongly called High Performer
 
-        Large numbers on the diagonal mean the model is performing well.
+        Large numbers on the diagonal = good performance.
         """)
 
     st.markdown("---")
     st.subheader("Feature Importance")
-    st.markdown("Which attributes matter most for predicting business performance?")
 
     importance_df = pd.DataFrame({
-        'Feature': ['avg_obstacle_severity', 'local_sales_pct',
-                    'business_type', 'repeat_customer_pct',
-                    'electricity_problems', 'owner_gender',
-                    'location', 'edu_level',
-                    'finance_access', 'supplier_issues'],
+        'Feature': [
+            'avg_obstacle_severity', 'local_sales_pct',
+            'business_type', 'repeat_customer_pct',
+            'electricity_problems', 'owner_gender',
+            'location', 'edu_level',
+            'finance_access', 'supplier_issues'
+        ],
         'Importance': [0.42, 0.18, 0.16, 0.15, 0.05, 0.04,
                        0.00, 0.00, 0.00, 0.00]
     }).sort_values('Importance', ascending=True)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    colors = ['#1F4E79' if v > 0.10 else '#2E75B6' if v > 0.03 else '#BDD0E5'
-              for v in importance_df['Importance']]
+    colors = [
+        '#1F4E79' if v > 0.10 else '#2E75B6' if v > 0.03 else '#BDD0E5'
+        for v in importance_df['Importance']
+    ]
     ax.barh(importance_df['Feature'], importance_df['Importance'], color=colors)
     ax.set_xlabel('Importance Score')
     ax.set_title('Which Attributes Best Predict Business Performance?',
                  fontweight='bold')
     plt.tight_layout()
     st.pyplot(fig)
-    st.caption("Average obstacle severity is the strongest predictor "
-               "with a score of 0.42.")
+    st.caption(
+        "Average obstacle severity is the strongest predictor (score 0.42), "
+        "more than twice the next variable."
+    )
 
 # ============================================================
 # PAGE 6: PREDICT A BUSINESS
 # ============================================================
 elif page == "🔮 Predict a Business":
     st.title("Predict Business Performance")
-    st.markdown("Fill in the details of any informal business below. "
-                "The model will predict whether it is likely to be a "
-                "**High Performer** or **Struggling**.")
+    st.markdown(
+        "Fill in the details of any informal business. "
+        "The model will predict whether it is likely to be a "
+        "**High Performer** or **Struggling**."
+    )
     st.markdown("---")
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Business Details")
-        location = st.selectbox("Location", ["Urban", "Semi_urban"])
-        business_type = st.selectbox("Business Type", [
+        location       = st.selectbox("Location", ["Urban", "Semi_urban"])
+        business_type  = st.selectbox("Business Type", [
             "Retail_Trade", "Food_Catering",
             "Manufacturing", "Services", "Other"])
-        owner_gender = st.selectbox("Owner Gender", ["Male", "Female"])
-        edu_level = st.selectbox("Education Level of Owner", [
+        owner_gender   = st.selectbox("Owner Gender", ["Male", "Female"])
+        edu_level      = st.selectbox("Education Level", [
             "Primary", "None", "Secondary",
             "Technical", "University", "Other"])
-        finance_access = st.selectbox(
-            "Has Access to Formal Finance?", ["No", "Yes"])
+        finance_access = st.selectbox("Has Access to Finance?", ["No", "Yes"])
 
     with col2:
         st.subheader("Business Environment")
-        electricity_problems = st.selectbox(
-            "Faces Electricity Problems?", ["Yes", "No"])
-        supplier_issues = st.selectbox(
-            "Faces Supplier or Supply Chain Issues?", ["Yes", "No"])
+        electricity_problems  = st.selectbox("Faces Electricity Problems?", ["Yes", "No"])
+        supplier_issues       = st.selectbox("Faces Supplier Issues?", ["Yes", "No"])
         avg_obstacle_severity = st.slider(
-            "Average Business Obstacle Severity",
-            min_value=1.0, max_value=5.0, value=2.5, step=0.1,
-            help="1 = No obstacles at all, 5 = Very severe obstacles")
-        local_sales_pct = st.slider(
-            "Percentage of Sales to Local Customers (%)",
-            min_value=0.0, max_value=100.0, value=50.0, step=1.0)
-        repeat_customer_pct = st.slider(
-            "Percentage of Repeat (Loyal) Customers (%)",
-            min_value=0.0, max_value=100.0, value=40.0, step=1.0)
+            "Average Obstacle Severity (1=Low, 5=High)",
+            1.0, 5.0, 2.5, 0.1)
+        local_sales_pct       = st.slider("Local Sales %", 0.0, 100.0, 50.0, 1.0)
+        repeat_customer_pct   = st.slider("Repeat Customer %", 0.0, 100.0, 40.0, 1.0)
 
     st.markdown("---")
 
@@ -659,28 +667,28 @@ elif page == "🔮 Predict a Business":
 
         new_df = pd.DataFrame([new_business])
 
-        # Encode categorical columns
+        # Encode categorical columns using saved encoders
         for col in feature_cols:
             if col in label_encoders:
-                le = label_encoders[col]
+                le    = label_encoders[col]
                 known = list(le.classes_)
-                new_df[col] = new_df[col].astype(str).apply(
-                    lambda x: le.transform([x])[0] if x in known
-                    else le.transform([known[0]])[0]
-                )
+                val   = str(new_df[col].iloc[0])
+                new_df[col] = le.transform([val])[0] if val in known \
+                              else le.transform([known[0]])[0]
+            else:
+                new_df[col] = pd.to_numeric(new_df[col], errors='coerce').fillna(0)
 
-        # Convert to numpy array to match training format
-        input_array = new_df[feature_cols].values.astype(float)
+        # Apply imputer and convert to array
+        input_array = imputer.transform(new_df[feature_cols])
 
         prediction_encoded = model.predict(input_array)
-        prediction_label = le_target.inverse_transform(prediction_encoded)[0]
-        prediction_proba = model.predict_proba(input_array)[0]
+        prediction_label   = le_target.inverse_transform(prediction_encoded)[0]
+        prediction_proba   = model.predict_proba(input_array)[0]
 
-        classes = le_target.classes_
+        classes    = le_target.classes_
         proba_dict = dict(zip(classes, prediction_proba))
-
-        hp_prob = proba_dict.get('High_Performer', 0)
-        st_prob = proba_dict.get('Struggling', 0)
+        hp_prob    = proba_dict.get('High_Performer', 0)
+        st_prob    = proba_dict.get('Struggling', 0)
 
         st.markdown("---")
         st.subheader("Prediction Result")
@@ -690,15 +698,15 @@ elif page == "🔮 Predict a Business":
         else:
             st.error("### This business is predicted to be STRUGGLING")
 
-        col3, col4, col5 = st.columns(3)
-        col3.metric("High Performer Probability", f"{hp_prob*100:.1f}%")
-        col4.metric("Struggling Probability", f"{st_prob*100:.1f}%")
-        col5.metric("Model Confidence", f"{max(hp_prob, st_prob)*100:.1f}%")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("High Performer Probability", f"{hp_prob*100:.1f}%")
+        c2.metric("Struggling Probability",     f"{st_prob*100:.1f}%")
+        c3.metric("Model Confidence",           f"{max(hp_prob, st_prob)*100:.1f}%")
 
         st.markdown("---")
-        col6, col7 = st.columns(2)
+        col3, col4 = st.columns(2)
 
-        with col6:
+        with col3:
             st.subheader("Confidence Chart")
             fig, ax = plt.subplots(figsize=(6, 3))
             bars = ax.barh(
@@ -715,11 +723,9 @@ elif page == "🔮 Predict a Business":
             plt.tight_layout()
             st.pyplot(fig)
 
-        with col7:
-            st.subheader("What Most Influences This Prediction")
+        with col4:
+            st.subheader("Key Influencing Factors")
             st.markdown("""
-            Based on feature importance from the trained model:
-
             1. **avg_obstacle_severity (42%)** — most decisive factor
             2. **local_sales_pct (18%)** — selling beyond local area helps
             3. **business_type (16%)** — sector matters significantly
@@ -729,8 +735,7 @@ elif page == "🔮 Predict a Business":
 
         st.markdown("---")
         st.subheader("Business Profile Summary")
-        summary_df = pd.DataFrame(
-            list(new_business.items()),
-            columns=['Attribute', 'Value']
+        st.dataframe(
+            pd.DataFrame(list(new_business.items()), columns=['Attribute', 'Value']),
+            use_container_width=True
         )
-        st.dataframe(summary_df, use_container_width=True)
